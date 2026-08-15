@@ -1,0 +1,8 @@
+{
+  "id": "guns",
+  "name": "Guns",
+  "version": "0.1.0",
+  "author": "mojomast",
+  "description": "Adds an aimable pistol, shotgun, assault rifle, and machine gun.",
+  "dependencies": []
+}
