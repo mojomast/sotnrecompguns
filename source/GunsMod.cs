@@ -14,6 +14,7 @@ namespace GunsMod;
 
 public sealed class Guns : IMod
 {
+    private const string BuildVersion = "0.1.2";
     private const uint Marker = 0x534E5547; // "GUNS" in little endian guest memory.
     private const uint EntityNullAddress = 0x8011A4C8;
     private const uint AssignAttackerIdAddress = 0x80118894;
@@ -23,6 +24,7 @@ public sealed class Guns : IMod
     private const int MarkerOffset = 0;
     private const int LifetimeOffset = 4;
     private const int GunKindOffset = 6;
+    private const int PendingDestroyOffset = 7;
     private const int EquipIdOffset = 0x32;
     private const ushort ProjectileEntityId = 0x3E;
     private const int PhysicalElement = 0x40;
@@ -37,6 +39,8 @@ public sealed class Guns : IMod
     private const uint BackbufferYAddress = 0x8006C3A0;
     private const uint OrderingTableOffset = 0x474;
     private const int OrderingTableSize = 0x200;
+    private const int ForegroundOrder = OrderingTableSize - 1;
+    private const int PatchCheckInterval = 60;
     private const string SettingsPrefix = "mods.guns.";
 
     private static Guns? _instance;
@@ -45,6 +49,7 @@ public sealed class Guns : IMod
     private readonly byte[][] _originalNames = new byte[GunCatalog.All.Length][];
     private readonly uint[] _nameAddresses = new uint[GunCatalog.All.Length];
     private readonly byte[] _originalChainLimit = new byte[GunCatalog.All.Length];
+    private uint _equipmentDefinitions;
 
     private float _aimX = 1f;
     private float _aimY;
@@ -59,7 +64,11 @@ public sealed class Guns : IMod
     private bool _reloadPressed;
     private bool _previousFireHeld;
     private bool _previousReloadHeld;
-    private int _fireBuffer;
+    private bool _semiAutoShotQueued;
+    private int _inputGunIndex = -1;
+    private bool _aimEngaged;
+    private int _patchCheckRemaining;
+    private uint _renderCallbacks;
     private uint _shotSequence;
 
     public void OnLoad()
@@ -88,6 +97,8 @@ public sealed class Guns : IMod
 
     public void DrawSettings()
     {
+        ImGui.TextDisabled($"Guns v{BuildVersion}");
+
         bool autoReload = _autoReload;
         if (ImGui.Checkbox("Automatically reload", ref autoReload))
         {
@@ -130,6 +141,8 @@ public sealed class Guns : IMod
         }
         ImGui.TextDisabled("Aim: right stick | Fire: R2 | Reload: R1");
         ImGui.TextDisabled("Gun item names replace Shuriken, Cross shuriken, Buffalo star, and Flame star.");
+        ImGui.Text($"Right stick: {Controller.RightX}, {Controller.RightY} | Aim: {_aimX:F2}, {_aimY:F2}");
+        ImGui.Text($"Runtime: names {(_namesPatched ? "patched" : "pending")} | render callbacks: {_renderCallbacks}");
     }
 
     private void OnPlayerLoaded(PlayerLoadedEvent e)
@@ -183,6 +196,7 @@ public sealed class Guns : IMod
 
     private void OnVSync(VSyncEvent e)
     {
+        EnsureRuntimePatches();
         if (!CanUseGuns())
         {
             ResetInput();
@@ -190,11 +204,11 @@ public sealed class Guns : IMod
         }
 
         UpdateAim();
-        SampleButtons();
         int gunIndex = EquippedGunIndex();
+        SampleButtons(gunIndex);
         if (gunIndex < 0)
         {
-            _fireBuffer = 0;
+            _semiAutoShotQueued = false;
             return;
         }
 
@@ -204,6 +218,7 @@ public sealed class Guns : IMod
 
         if (state.ReloadRemaining > 0)
         {
+            _semiAutoShotQueued = false;
             if (--state.ReloadRemaining == 0) CompleteReload(gunIndex);
             return;
         }
@@ -214,7 +229,7 @@ public sealed class Guns : IMod
             return;
         }
 
-        bool wantsShot = gun.Automatic ? _fireHeld : _fireBuffer > 0;
+        bool wantsShot = gun.Automatic ? _fireHeld : _semiAutoShotQueued;
         if (!wantsShot || state.Cooldown > 0) return;
         if (state.Magazine <= 0)
         {
@@ -222,12 +237,23 @@ public sealed class Guns : IMod
             return;
         }
 
-        if (Fire(gunIndex) > 0)
+        int spawned = Fire(gunIndex);
+        if (!gun.Automatic) _semiAutoShotQueued = false;
+        if (spawned > 0)
         {
             state.Magazine--;
             state.Cooldown = gun.FireInterval;
-            _fireBuffer = 0;
         }
+    }
+
+    private void EnsureRuntimePatches()
+    {
+        if (!Game.Available || !Game.InAlucardMode()) return;
+        if (_equipmentPatched && _namesPatched && --_patchCheckRemaining > 0) return;
+
+        ApplyEquipmentPatches();
+        PatchNames();
+        _patchCheckRemaining = PatchCheckInterval;
     }
 
     private static bool CanUseGuns()
@@ -242,13 +268,19 @@ public sealed class Guns : IMod
         float x = NormalizeAxis(Controller.RightX);
         float y = -NormalizeAxis(Controller.RightY);
         float magnitude = MathF.Sqrt(x * x + y * y);
-        if (magnitude <= _deadzone)
+        float threshold = _aimEngaged ? _deadzone * 0.7f : _deadzone;
+        if (magnitude <= threshold)
         {
+            _aimEngaged = false;
             if (MathF.Abs(_aimX) < 0.001f && MathF.Abs(_aimY) < 0.001f)
                 _aimX = Player.FacingLeft ? -1f : 1f;
             return;
         }
 
+        _aimEngaged = true;
+        if (MathF.Abs(x) > MathF.Abs(y) * 2f) y = 0f;
+        else if (MathF.Abs(y) > MathF.Abs(x) * 2f) x = 0f;
+        magnitude = MathF.Sqrt(x * x + y * y);
         _aimX = x / magnitude;
         _aimY = y / magnitude;
         if (MathF.Abs(_aimX) > 0.08f) Player.FacingLeft = _aimX < 0f;
@@ -260,14 +292,19 @@ public sealed class Guns : IMod
         return delta >= 0 ? delta / 127f : delta / 128f;
     }
 
-    private void SampleButtons()
+    private void SampleButtons(int gunIndex)
     {
         _fireHeld = (Controller.State & FireButtonMask) == 0;
         bool reloadHeld = (Controller.State & ReloadButtonMask) == 0;
         _firePressed = _fireHeld && !_previousFireHeld;
         _reloadPressed = reloadHeld && !_previousReloadHeld;
-        if (_firePressed) _fireBuffer = 6;
-        else if (_fireBuffer > 0) _fireBuffer--;
+        if (_inputGunIndex != gunIndex)
+        {
+            _semiAutoShotQueued = false;
+            _inputGunIndex = gunIndex;
+        }
+        if (_firePressed && gunIndex >= 0 && !GunCatalog.All[gunIndex].Automatic)
+            _semiAutoShotQueued = true;
         _previousFireHeld = _fireHeld;
         _previousReloadHeld = reloadHeld;
     }
@@ -342,7 +379,7 @@ public sealed class Guns : IMod
         entity.FacingLeft = (ushort)(dirX < 0 ? 1 : 0);
         entity.Update = EntityNullAddress;
         entity.Step = 1;
-        entity.Flags = (int)(EntityFlags.PosCameraLocked | EntityFlags.Unk100000 | EntityFlags.NotAnEnemy);
+        entity.Flags = (int)(EntityFlags.PosCameraLocked | EntityFlags.KeepAliveOffCamera | EntityFlags.NotAnEnemy);
         entity.HitboxState = HitboxState;
         entity.HitboxWidth = gun.Kind == GunKind.Shotgun ? (byte)5 : (byte)4;
         entity.HitboxHeight = gun.Kind == GunKind.Shotgun ? (byte)5 : (byte)3;
@@ -354,6 +391,7 @@ public sealed class Guns : IMod
         entity.SetExtU32(MarkerOffset, Marker);
         entity.SetExtU16(LifetimeOffset, (ushort)gun.Lifetime);
         entity.SetExtU8(GunKindOffset, (byte)gun.Kind);
+        entity.SetExtU8(PendingDestroyOffset, 0);
 
         memory.WriteU16(entity.Addr + 0x26, ProjectileEntityId);
         GameApi.Call(AssignAttackerIdAddress, entity.Addr);
@@ -373,6 +411,7 @@ public sealed class Guns : IMod
         ref readonly var gun = ref GunCatalog.All[gunIndex];
         ref var state = ref _states[gunIndex];
         if (state.ReloadRemaining > 0 || state.Magazine >= gun.MagazineSize || state.Reserve <= 0) return;
+        _semiAutoShotQueued = false;
         state.ReloadRemaining = gun.ReloadFrames;
     }
 
@@ -401,15 +440,20 @@ public sealed class Guns : IMod
         _reloadPressed = false;
         _previousFireHeld = false;
         _previousReloadHeld = false;
-        _fireBuffer = 0;
+        _semiAutoShotQueued = false;
+        _inputGunIndex = -1;
+        _aimEngaged = false;
     }
 
-    private void ApplyEquipmentPatches()
+    private bool ApplyEquipmentPatches()
     {
-        if (!Game.Available) return;
+        if (!Game.Available) return false;
         IMemory memory = Runtime.Mem!;
         uint definitions = GameApi.EquipDefs;
-        if (definitions == 0) return;
+        if (definitions == 0) return false;
+
+        if (_equipmentPatched && _equipmentDefinitions != definitions)
+            _equipmentPatched = false;
 
         for (int i = 0; i < GunCatalog.All.Length; i++)
         {
@@ -420,7 +464,9 @@ public sealed class Guns : IMod
             }
             memory.WriteU8(record + 0x16, 31);
         }
+        _equipmentDefinitions = definitions;
         _equipmentPatched = true;
+        return true;
     }
 
     private void RestoreEquipment()
@@ -428,7 +474,12 @@ public sealed class Guns : IMod
         if (!_equipmentPatched || !Game.Available) return;
         IMemory memory = Runtime.Mem!;
         uint definitions = GameApi.EquipDefs;
-        if (definitions == 0) return;
+        if (definitions == 0 || definitions != _equipmentDefinitions)
+        {
+            _equipmentPatched = false;
+            _equipmentDefinitions = 0;
+            return;
+        }
         for (int i = 0; i < GunCatalog.All.Length; i++)
         {
             uint record = definitions + (uint)(GunCatalog.All[i].ItemId * 0x32);
@@ -436,14 +487,15 @@ public sealed class Guns : IMod
                 memory.WriteU8(record + 0x16, _originalChainLimit[i]);
         }
         _equipmentPatched = false;
+        _equipmentDefinitions = 0;
     }
 
-    private void PatchNames()
+    private bool PatchNames()
     {
-        if (!Game.Available) return;
+        if (!Game.Available) return false;
         IMemory memory = Runtime.Mem!;
         uint definitions = GameApi.EquipDefs;
-        if (definitions == 0) return;
+        if (definitions == 0) return false;
 
         var addresses = new uint[GunCatalog.All.Length];
         for (int i = 0; i < GunCatalog.All.Length; i++)
@@ -452,8 +504,16 @@ public sealed class Guns : IMod
             if (addresses[i] == 0 || Array.IndexOf(addresses, addresses[i], 0, i) >= 0)
             {
                 Console.Error.WriteLine("[Guns] item name buffers are unavailable or aliased; names were not patched");
-                return;
+                return false;
             }
+        }
+
+        if (_namesPatched)
+        {
+            bool sameBuffers = true;
+            for (int i = 0; i < addresses.Length; i++)
+                sameBuffers &= addresses[i] == _nameAddresses[i];
+            if (!sameBuffers) _namesPatched = false;
         }
 
         if (!_namesPatched)
@@ -461,11 +521,15 @@ public sealed class Guns : IMod
             var originals = new byte[GunCatalog.All.Length][];
             for (int i = 0; i < GunCatalog.All.Length; i++)
             {
-                originals[i] = ReadGameString(memory, addresses[i]);
+                if (!TryReadGameString(memory, addresses[i], out originals[i]))
+                {
+                    Console.Error.WriteLine($"[Guns] could not read name buffer for {GunCatalog.All[i].Name}; retrying later");
+                    return false;
+                }
                 if (originals[i].Length < GunCatalog.All[i].ItemName.Length + 2)
                 {
                     Console.Error.WriteLine($"[Guns] name buffer for {GunCatalog.All[i].Name} is too small");
-                    return;
+                    return false;
                 }
             }
             for (int i = 0; i < GunCatalog.All.Length; i++)
@@ -477,7 +541,18 @@ public sealed class Guns : IMod
 
         for (int i = 0; i < GunCatalog.All.Length; i++)
             WriteGameString(memory, addresses[i], GunCatalog.All[i].ItemName);
+        for (int i = 0; i < GunCatalog.All.Length; i++)
+        {
+            if (MatchesGameString(memory, addresses[i], GunCatalog.All[i].ItemName)) continue;
+            Console.Error.WriteLine($"[Guns] name patch verification failed for {GunCatalog.All[i].Name}; retrying later");
+            for (int original = 0; original < _originalNames.Length; original++)
+                for (int b = 0; b < _originalNames[original].Length; b++)
+                    memory.WriteU8(addresses[original] + (uint)b, _originalNames[original][b]);
+            _namesPatched = false;
+            return false;
+        }
         _namesPatched = true;
+        return true;
     }
 
     private void RestoreNames()
@@ -494,17 +569,21 @@ public sealed class Guns : IMod
         _namesPatched = false;
     }
 
-    private static byte[] ReadGameString(IMemory memory, uint address)
+    private static bool TryReadGameString(IMemory memory, uint address, out byte[] bytes)
     {
         const int maxLength = 32;
-        var bytes = new byte[maxLength];
+        var buffer = new byte[maxLength];
         for (int i = 0; i < maxLength; i++)
         {
-            bytes[i] = memory.ReadU8(address + (uint)i);
-            if (i > 0 && bytes[i - 1] == 0xFF && bytes[i] == 0)
-                return bytes[..(i + 1)];
+            buffer[i] = memory.ReadU8(address + (uint)i);
+            if (i > 0 && buffer[i - 1] == 0xFF && buffer[i] == 0)
+            {
+                bytes = buffer[..(i + 1)];
+                return true;
+            }
         }
-        throw new InvalidOperationException($"unterminated equipment name at 0x{address:X8}");
+        bytes = [];
+        return false;
     }
 
     private static void WriteGameString(IMemory memory, uint address, string text)
@@ -585,17 +664,29 @@ public sealed class Guns : IMod
             if (!IsProjectile(entity)) continue;
 
             ushort lifetime = entity.ExtU16(LifetimeOffset);
-            if (entity.HitFlags != 0 || lifetime <= 1)
+            if (entity.ExtU8(PendingDestroyOffset) != 0 || lifetime <= 1)
             {
                 entity.Destroy();
+                continue;
+            }
+
+            if (entity.HitFlags != 0)
+            {
+                entity.HitboxState = 0;
+                entity.SetExtU8(PendingDestroyOffset, 1);
                 continue;
             }
 
             entity.SetExtU16(LifetimeOffset, (ushort)(lifetime - 1));
             entity.PosXRaw += entity.VelocityX;
             entity.PosYRaw += entity.VelocityY;
-            if (entity.PosX < -24 || entity.PosX > 280 || entity.PosY < -24 || entity.PosY > 264)
-                entity.Destroy();
+            int margin = Display.WideMargin(256);
+            if (entity.PosX < -32 - margin || entity.PosX > 288 + margin ||
+                entity.PosY < -16 || entity.PosY > 256)
+            {
+                entity.HitboxState = 0;
+                entity.SetExtU8(PendingDestroyOffset, 1);
+            }
         }
     }
 
@@ -603,13 +694,15 @@ public sealed class Guns : IMod
     private static void Render(CpuContext context, IMemory memory)
     {
         Guns? mod = _instance;
-        if (mod == null || !CanUseGuns() || mod.EquippedGunIndex() < 0) return;
+        if (mod == null || !Game.Available || !Game.InGame) return;
+        mod._renderCallbacks++;
 
         int bufferX = (int)memory.ReadU32(BackbufferXAddress);
         int bufferY = (int)memory.ReadU32(BackbufferYAddress);
-        GpuPrims.SetOrderingTable(memory.ReadU32(CurrentBufferPointer) + OrderingTableOffset, OrderingTableSize);
+        uint currentBuffer = memory.ReadU32(CurrentBufferPointer);
+        if (currentBuffer == 0) return;
+        GpuPrims.SetOrderingTable(currentBuffer + OrderingTableOffset, OrderingTableSize);
 
-        int order = Math.Clamp(Player.Entity.ZPriority - 2, 0, OrderingTableSize - 1);
         foreach (Entity projectile in Entities.Range(ProjectileStart, ProjectileEnd))
         {
             if (!IsProjectile(projectile)) continue;
@@ -617,13 +710,15 @@ public sealed class Guns : IMod
             float y = bufferY + projectile.PosY;
             float vx = projectile.VelocityX / 65536f;
             float vy = projectile.VelocityY / 65536f;
-            DrawTracer(order, x - vx * 1.5f, y - vy * 1.5f, x, y, 1.25f, 255, 224, 96);
+            DrawTracer(ForegroundOrder, x - vx * 1.5f, y - vy * 1.5f, x, y, 1.25f, 255, 224, 96);
         }
+
+        if (!CanUseGuns() || mod.EquippedGunIndex() < 0) return;
 
         float anchorX = bufferX + Player.PosX;
         float anchorY = bufferY + Player.PosY - 10;
-        DrawGun(order, anchorX, anchorY, mod._aimX, mod._aimY);
-        DrawAimArrow(0, anchorX, anchorY, mod._aimX, mod._aimY);
+        DrawGun(ForegroundOrder, anchorX, anchorY, mod._aimX, mod._aimY);
+        DrawAimArrow(ForegroundOrder, anchorX, anchorY, mod._aimX, mod._aimY);
     }
 
     private static void DrawGun(int order, float x, float y, float dirX, float dirY)

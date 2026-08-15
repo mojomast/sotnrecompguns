@@ -2,7 +2,7 @@
 
 An experimental [SymphonyRecomp](https://github.com/BlackLabelHQ/SymphonyRecomp) mod that adds four aimable firearms to Castlevania: Symphony of the Night.
 
-The mod provides right-stick aiming, distinct fire rates and spread, magazines, reserve ammunition, manual reloading, tracers, and a crosshair. It uses SOTN's normal attack entities so enemy defense, damage, death, drops, experience, and boss behavior remain in the game's combat pipeline.
+The mod provides right-stick aiming, distinct fire rates and spread, magazines, reserve ammunition, manual reloading, tracers, and an aim arrow. It uses SOTN's normal attack entities so enemy defense, damage, death, drops, experience, and boss behavior remain in the game's combat pipeline.
 
 ## Status
 
@@ -36,6 +36,8 @@ The items are renamed and made reusable while the mod is active. They are grante
 
 SymphonyRecomp compiles the files under `source/` at runtime, so the mod does not require a separate build step.
 
+When updating an existing clone, run `git pull`, reload the mod, and confirm `Guns v0.1.2` appears at the top of its settings panel.
+
 ## Controls
 
 - Equip one of the four gun items in either hand.
@@ -57,6 +59,8 @@ The SymphonyRecomp mods panel exposes options for:
 - Right-stick deadzone.
 - Weapon spread scaling.
 - Refilling all ammunition.
+
+The bottom of the settings panel shows the raw right-stick values, normalized aim direction, item-name patch status, and render-hook activity for controller and mod troubleshooting.
 
 ## Prototype limitations
 
