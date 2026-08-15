@@ -46,6 +46,8 @@ SymphonyRecomp compiles the files under `source/` at runtime, so the mod does no
 
 The pistol and shotgun are semi-automatic. The assault rifle and machine gun fire while `R2` is held.
 
+A black-outlined yellow arrow shows the current aim direction while a gun is equipped.
+
 ## Configuration
 
 The SymphonyRecomp mods panel exposes options for:

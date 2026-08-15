@@ -29,6 +29,7 @@ public sealed class Guns : IMod
     private const int HitboxState = 2;
     private const int HitEffect = 0x81;
     private const int StunFrames = 4;
+    private const uint EquippedHandsAddress = 0x80097C00;
     private const int FireButtonMask = Controller.R2;
     private const int ReloadButtonMask = Controller.R1;
     private const uint CurrentBufferPointer = 0x8006C37C;
@@ -43,7 +44,6 @@ public sealed class Guns : IMod
     private readonly GunState[] _states = new GunState[GunCatalog.All.Length];
     private readonly byte[][] _originalNames = new byte[GunCatalog.All.Length][];
     private readonly uint[] _nameAddresses = new uint[GunCatalog.All.Length];
-    private readonly byte[] _originalConsumable = new byte[GunCatalog.All.Length];
     private readonly byte[] _originalChainLimit = new byte[GunCatalog.All.Length];
 
     private float _aimX = 1f;
@@ -59,6 +59,7 @@ public sealed class Guns : IMod
     private bool _reloadPressed;
     private bool _previousFireHeld;
     private bool _previousReloadHeld;
+    private int _fireBuffer;
     private uint _shotSequence;
 
     public void OnLoad()
@@ -191,7 +192,11 @@ public sealed class Guns : IMod
         UpdateAim();
         SampleButtons();
         int gunIndex = EquippedGunIndex();
-        if (gunIndex < 0) return;
+        if (gunIndex < 0)
+        {
+            _fireBuffer = 0;
+            return;
+        }
 
         ref readonly var gun = ref GunCatalog.All[gunIndex];
         ref var state = ref _states[gunIndex];
@@ -209,7 +214,7 @@ public sealed class Guns : IMod
             return;
         }
 
-        bool wantsShot = gun.Automatic ? _fireHeld : _firePressed;
+        bool wantsShot = gun.Automatic ? _fireHeld : _fireBuffer > 0;
         if (!wantsShot || state.Cooldown > 0) return;
         if (state.Magazine <= 0)
         {
@@ -221,6 +226,7 @@ public sealed class Guns : IMod
         {
             state.Magazine--;
             state.Cooldown = gun.FireInterval;
+            _fireBuffer = 0;
         }
     }
 
@@ -260,6 +266,8 @@ public sealed class Guns : IMod
         bool reloadHeld = (Controller.State & ReloadButtonMask) == 0;
         _firePressed = _fireHeld && !_previousFireHeld;
         _reloadPressed = reloadHeld && !_previousReloadHeld;
+        if (_firePressed) _fireBuffer = 6;
+        else if (_fireBuffer > 0) _fireBuffer--;
         _previousFireHeld = _fireHeld;
         _previousReloadHeld = reloadHeld;
     }
@@ -393,6 +401,7 @@ public sealed class Guns : IMod
         _reloadPressed = false;
         _previousFireHeld = false;
         _previousReloadHeld = false;
+        _fireBuffer = 0;
     }
 
     private void ApplyEquipmentPatches()
@@ -408,10 +417,8 @@ public sealed class Guns : IMod
             if (!_equipmentPatched)
             {
                 _originalChainLimit[i] = memory.ReadU8(record + 0x16);
-                _originalConsumable[i] = memory.ReadU8(record + 0x19);
             }
             memory.WriteU8(record + 0x16, 31);
-            memory.WriteU8(record + 0x19, 0);
         }
         _equipmentPatched = true;
     }
@@ -427,8 +434,6 @@ public sealed class Guns : IMod
             uint record = definitions + (uint)(GunCatalog.All[i].ItemId * 0x32);
             if (memory.ReadU8(record + 0x16) == 31)
                 memory.WriteU8(record + 0x16, _originalChainLimit[i]);
-            if (memory.ReadU8(record + 0x19) == 0)
-                memory.WriteU8(record + 0x19, _originalConsumable[i]);
         }
         _equipmentPatched = false;
     }
@@ -440,18 +445,38 @@ public sealed class Guns : IMod
         uint definitions = GameApi.EquipDefs;
         if (definitions == 0) return;
 
+        var addresses = new uint[GunCatalog.All.Length];
         for (int i = 0; i < GunCatalog.All.Length; i++)
         {
-            ref readonly var gun = ref GunCatalog.All[i];
-            uint address = memory.ReadU32(definitions + (uint)(gun.ItemId * 0x32));
-            if (address == 0) continue;
-            if (!_namesPatched)
+            addresses[i] = memory.ReadU32(definitions + (uint)(GunCatalog.All[i].ItemId * 0x32));
+            if (addresses[i] == 0 || Array.IndexOf(addresses, addresses[i], 0, i) >= 0)
             {
-                _nameAddresses[i] = address;
-                _originalNames[i] = ReadBytes(memory, address, gun.ItemName.Length + 1);
+                Console.Error.WriteLine("[Guns] item name buffers are unavailable or aliased; names were not patched");
+                return;
             }
-            WriteAscii(memory, address, gun.ItemName);
         }
+
+        if (!_namesPatched)
+        {
+            var originals = new byte[GunCatalog.All.Length][];
+            for (int i = 0; i < GunCatalog.All.Length; i++)
+            {
+                originals[i] = ReadGameString(memory, addresses[i]);
+                if (originals[i].Length < GunCatalog.All[i].ItemName.Length + 2)
+                {
+                    Console.Error.WriteLine($"[Guns] name buffer for {GunCatalog.All[i].Name} is too small");
+                    return;
+                }
+            }
+            for (int i = 0; i < GunCatalog.All.Length; i++)
+            {
+                _nameAddresses[i] = addresses[i];
+                _originalNames[i] = originals[i];
+            }
+        }
+
+        for (int i = 0; i < GunCatalog.All.Length; i++)
+            WriteGameString(memory, addresses[i], GunCatalog.All[i].ItemName);
         _namesPatched = true;
     }
 
@@ -462,31 +487,40 @@ public sealed class Guns : IMod
         for (int i = 0; i < _originalNames.Length; i++)
         {
             if (_nameAddresses[i] == 0 || _originalNames[i] == null) continue;
-            if (!MatchesAscii(memory, _nameAddresses[i], GunCatalog.All[i].ItemName)) continue;
+            if (!MatchesGameString(memory, _nameAddresses[i], GunCatalog.All[i].ItemName)) continue;
             for (int j = 0; j < _originalNames[i].Length; j++)
                 memory.WriteU8(_nameAddresses[i] + (uint)j, _originalNames[i][j]);
         }
         _namesPatched = false;
     }
 
-    private static byte[] ReadBytes(IMemory memory, uint address, int count)
+    private static byte[] ReadGameString(IMemory memory, uint address)
     {
-        var bytes = new byte[count];
-        for (int i = 0; i < count; i++) bytes[i] = memory.ReadU8(address + (uint)i);
-        return bytes;
+        const int maxLength = 32;
+        var bytes = new byte[maxLength];
+        for (int i = 0; i < maxLength; i++)
+        {
+            bytes[i] = memory.ReadU8(address + (uint)i);
+            if (i > 0 && bytes[i - 1] == 0xFF && bytes[i] == 0)
+                return bytes[..(i + 1)];
+        }
+        throw new InvalidOperationException($"unterminated equipment name at 0x{address:X8}");
     }
 
-    private static void WriteAscii(IMemory memory, uint address, string text)
-    {
-        for (int i = 0; i < text.Length; i++) memory.WriteU8(address + (uint)i, (byte)text[i]);
-        memory.WriteU8(address + (uint)text.Length, 0);
-    }
-
-    private static bool MatchesAscii(IMemory memory, uint address, string text)
+    private static void WriteGameString(IMemory memory, uint address, string text)
     {
         for (int i = 0; i < text.Length; i++)
-            if (memory.ReadU8(address + (uint)i) != (byte)text[i]) return false;
-        return memory.ReadU8(address + (uint)text.Length) == 0;
+            memory.WriteU8(address + (uint)i, checked((byte)(text[i] - 0x20)));
+        memory.WriteU8(address + (uint)text.Length, 0xFF);
+        memory.WriteU8(address + (uint)text.Length + 1, 0);
+    }
+
+    private static bool MatchesGameString(IMemory memory, uint address, string text)
+    {
+        for (int i = 0; i < text.Length; i++)
+            if (memory.ReadU8(address + (uint)i) != (byte)(text[i] - 0x20)) return false;
+        return memory.ReadU8(address + (uint)text.Length) == 0xFF &&
+               memory.ReadU8(address + (uint)text.Length + 1) == 0;
     }
 
     private void CleanupProjectiles()
@@ -530,6 +564,17 @@ public sealed class Guns : IMod
         return false;
     }
 
+    [PreHook("dra", "func_800FDD44")]
+    private static bool PreserveGunInventory(CpuContext context, IMemory memory)
+    {
+        uint hand = context.A0;
+        if (hand > 1) return true;
+        uint itemId = memory.ReadU32(EquippedHandsAddress + hand * 4);
+        if (GunCatalog.IndexOfItem(itemId) < 0) return true;
+        context.V0 = 0;
+        return false;
+    }
+
     [PostHook("dra", "UpdatePlayerEntities")]
     private static void UpdateProjectiles(CpuContext context, IMemory memory)
     {
@@ -554,7 +599,7 @@ public sealed class Guns : IMod
         }
     }
 
-    [PostHook("dra", "RenderTilemap")]
+    [PostHook("dra", "RenderEntities")]
     private static void Render(CpuContext context, IMemory memory)
     {
         Guns? mod = _instance;
@@ -564,7 +609,7 @@ public sealed class Guns : IMod
         int bufferY = (int)memory.ReadU32(BackbufferYAddress);
         GpuPrims.SetOrderingTable(memory.ReadU32(CurrentBufferPointer) + OrderingTableOffset, OrderingTableSize);
 
-        int order = Math.Clamp(Player.Entity.ZPriority + 2, 0, OrderingTableSize - 1);
+        int order = Math.Clamp(Player.Entity.ZPriority - 2, 0, OrderingTableSize - 1);
         foreach (Entity projectile in Entities.Range(ProjectileStart, ProjectileEnd))
         {
             if (!IsProjectile(projectile)) continue;
@@ -578,7 +623,7 @@ public sealed class Guns : IMod
         float anchorX = bufferX + Player.PosX;
         float anchorY = bufferY + Player.PosY - 10;
         DrawGun(order, anchorX, anchorY, mod._aimX, mod._aimY);
-        DrawCrosshair(OrderingTableSize - 8, anchorX + mod._aimX * 54f, anchorY + mod._aimY * 54f);
+        DrawAimArrow(0, anchorX, anchorY, mod._aimX, mod._aimY);
     }
 
     private static void DrawGun(int order, float x, float y, float dirX, float dirY)
@@ -590,12 +635,44 @@ public sealed class Guns : IMod
             dirX * 0.45f + normalX * 0.9f, dirY * 0.45f + normalY * 0.9f, 8, 3, 72, 76, 84);
     }
 
-    private static void DrawCrosshair(int order, float x, float y)
+    private static void DrawAimArrow(int order, float x, float y, float dirX, float dirY)
     {
-        DrawTracer(order, x - 5, y, x - 2, y, 0.65f, 232, 64, 48);
-        DrawTracer(order, x + 2, y, x + 5, y, 0.65f, 232, 64, 48);
-        DrawTracer(order, x, y - 5, x, y - 2, 0.65f, 232, 64, 48);
-        DrawTracer(order, x, y + 2, x, y + 5, 0.65f, 232, 64, 48);
+        float nx = -dirY;
+        float ny = dirX;
+        float startX = x + dirX * 13f;
+        float startY = y + dirY * 13f;
+        float shaftX = x + dirX * 43f;
+        float shaftY = y + dirY * 43f;
+        float tipX = x + dirX * 52f;
+        float tipY = y + dirY * 52f;
+
+        DrawSolidTracer(order, startX, startY, shaftX, shaftY, 3f, 0, 0, 0);
+        DrawSolidTracer(order, startX, startY, shaftX, shaftY, 1.5f, 255, 232, 48);
+
+        var outlineA = new PrimVertex(tipX, tipY, 0, 0, 0);
+        var outlineB = new PrimVertex(shaftX + nx * 7f, shaftY + ny * 7f, 0, 0, 0);
+        var outlineC = new PrimVertex(shaftX - nx * 7f, shaftY - ny * 7f, 0, 0, 0);
+        GpuPrims.Tri(order, outlineA, outlineB, outlineC);
+
+        var arrowA = new PrimVertex(tipX - dirX * 2f, tipY - dirY * 2f, 255, 232, 48);
+        var arrowB = new PrimVertex(shaftX + nx * 4.5f, shaftY + ny * 4.5f, 255, 232, 48);
+        var arrowC = new PrimVertex(shaftX - nx * 4.5f, shaftY - ny * 4.5f, 255, 232, 48);
+        GpuPrims.Tri(order, arrowA, arrowB, arrowC);
+    }
+
+    private static void DrawSolidTracer(int order, float x0, float y0, float x1, float y1, float halfWidth,
+        byte r, byte g, byte b)
+    {
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float magnitude = MathF.Max(0.001f, MathF.Sqrt(dx * dx + dy * dy));
+        float nx = -dy / magnitude * halfWidth;
+        float ny = dx / magnitude * halfWidth;
+        var a = new PrimVertex(x0 - nx, y0 - ny, r, g, b);
+        var b0 = new PrimVertex(x1 - nx, y1 - ny, r, g, b);
+        var c = new PrimVertex(x0 + nx, y0 + ny, r, g, b);
+        var d = new PrimVertex(x1 + nx, y1 + ny, r, g, b);
+        GpuPrims.Quad(order, a, b0, c, d);
     }
 
     private static void DrawOrientedQuad(int order, float centerX, float centerY, float dirX, float dirY,
