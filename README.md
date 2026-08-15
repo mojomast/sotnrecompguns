@@ -19,7 +19,7 @@ The prototype repurposes four existing throwing-weapon inventory slots:
 | Buffalo star | Shotgun |
 | Flame star | Machine gun |
 
-The items are renamed and made reusable while the mod is active. They are granted when an Alucard game loads unless that option is disabled in the mod settings.
+The items are renamed, made reusable, and automatically granted while the mod is active.
 
 ## Installation
 
@@ -36,7 +36,7 @@ The items are renamed and made reusable while the mod is active. They are grante
 
 SymphonyRecomp compiles the files under `source/` at runtime, so the mod does not require a separate build step.
 
-When updating an existing clone, run `git pull`, reload the mod, and confirm `Guns v0.1.2` appears at the top of its settings panel.
+When updating an existing clone, run `git pull`, reload the mod, and confirm `Guns v0.1.3` appears at the top of its settings panel.
 
 ## Controls
 
@@ -48,14 +48,13 @@ When updating an existing clone, run `git pull`, reload the mod, and confirm `Gu
 
 The pistol and shotgun are semi-automatic. The assault rifle and machine gun fire while `R2` is held.
 
-A black-outlined yellow arrow shows the current aim direction while a gun is equipped.
+A compact black-outlined yellow arrow shows the current aim direction, and each attached gun graphic rotates with the stick.
 
 ## Configuration
 
 The SymphonyRecomp mods panel exposes options for:
 
 - Automatic reloading.
-- Granting the four weapon items when a game loads.
 - Right-stick deadzone.
 - Weapon spread scaling.
 - Refilling all ammunition.

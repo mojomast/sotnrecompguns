@@ -14,7 +14,7 @@ namespace GunsMod;
 
 public sealed class Guns : IMod
 {
-    private const string BuildVersion = "0.1.2";
+    private const string BuildVersion = "0.1.3";
     private const uint Marker = 0x534E5547; // "GUNS" in little endian guest memory.
     private const uint EntityNullAddress = 0x8011A4C8;
     private const uint AssignAttackerIdAddress = 0x80118894;
@@ -26,6 +26,11 @@ public sealed class Guns : IMod
     private const int GunKindOffset = 6;
     private const int PendingDestroyOffset = 7;
     private const int EquipIdOffset = 0x32;
+    private const uint EquipmentStride = 0x34;
+    private const uint EquipmentWeaponIdOffset = 0x0F;
+    private const uint EquipmentChainLimitOffset = 0x16;
+    private const uint EquipmentConsumableOffset = 0x19;
+    private const uint EquipmentIconOffset = 0x2C;
     private const ushort ProjectileEntityId = 0x3E;
     private const int PhysicalElement = 0x40;
     private const int HitboxState = 2;
@@ -49,6 +54,7 @@ public sealed class Guns : IMod
     private readonly byte[][] _originalNames = new byte[GunCatalog.All.Length][];
     private readonly uint[] _nameAddresses = new uint[GunCatalog.All.Length];
     private readonly byte[] _originalChainLimit = new byte[GunCatalog.All.Length];
+    private readonly byte[] _originalConsumable = new byte[GunCatalog.All.Length];
     private uint _equipmentDefinitions;
 
     private float _aimX = 1f;
@@ -56,7 +62,6 @@ public sealed class Guns : IMod
     private float _deadzone = 0.18f;
     private float _spreadScale = 1f;
     private bool _autoReload = true;
-    private bool _grantWeapons = true;
     private bool _namesPatched;
     private bool _equipmentPatched;
     private bool _fireHeld;
@@ -103,13 +108,6 @@ public sealed class Guns : IMod
         if (ImGui.Checkbox("Automatically reload", ref autoReload))
         {
             _autoReload = autoReload;
-            SaveSettings();
-        }
-
-        bool grantWeapons = _grantWeapons;
-        if (ImGui.Checkbox("Grant guns when a game loads", ref grantWeapons))
-        {
-            _grantWeapons = grantWeapons;
             SaveSettings();
         }
 
@@ -162,11 +160,7 @@ public sealed class Guns : IMod
     {
         ApplyEquipmentPatches();
         PatchNames();
-        if (_grantWeapons)
-        {
-            foreach (var gun in GunCatalog.All)
-                if (!OwnsGunItem(gun.ItemId)) Inventory.GrantHandItem(gun.ItemId);
-        }
+        EnsureGunOwnership();
         ResetAmmo();
     }
 
@@ -174,6 +168,13 @@ public sealed class Guns : IMod
         Inventory.HasHandItem(itemId) ||
         Inventory.GetWornEquipment(ItemSlot.LeftHand) == itemId ||
         Inventory.GetWornEquipment(ItemSlot.RightHand) == itemId;
+
+    private void EnsureGunOwnership()
+    {
+        if (!Game.Available || !Game.InAlucardMode()) return;
+        foreach (var gun in GunCatalog.All)
+            if (!OwnsGunItem(gun.ItemId)) Inventory.GrantHandItem(gun.ItemId);
+    }
 
     private void OnRoomLoaded(RoomLayerLoadEvent e)
     {
@@ -253,6 +254,7 @@ public sealed class Guns : IMod
 
         ApplyEquipmentPatches();
         PatchNames();
+        EnsureGunOwnership();
         _patchCheckRemaining = PatchCheckInterval;
     }
 
@@ -266,7 +268,7 @@ public sealed class Guns : IMod
     private void UpdateAim()
     {
         float x = NormalizeAxis(Controller.RightX);
-        float y = -NormalizeAxis(Controller.RightY);
+        float y = NormalizeAxis(Controller.RightY);
         float magnitude = MathF.Sqrt(x * x + y * y);
         float threshold = _aimEngaged ? _deadzone * 0.7f : _deadzone;
         if (magnitude <= threshold)
@@ -455,14 +457,33 @@ public sealed class Guns : IMod
         if (_equipmentPatched && _equipmentDefinitions != definitions)
             _equipmentPatched = false;
 
+        var records = new uint[GunCatalog.All.Length];
         for (int i = 0; i < GunCatalog.All.Length; i++)
         {
-            uint record = definitions + (uint)(GunCatalog.All[i].ItemId * 0x32);
+            if (!TryGetEquipmentRecord(memory, definitions, GunCatalog.All[i], out uint record))
+            {
+                Console.Error.WriteLine($"[Guns] equipment record validation failed for {GunCatalog.All[i].Name}");
+                return false;
+            }
+            records[i] = record;
             if (!_equipmentPatched)
             {
-                _originalChainLimit[i] = memory.ReadU8(record + 0x16);
+                _originalChainLimit[i] = memory.ReadU8(record + EquipmentChainLimitOffset);
+                _originalConsumable[i] = memory.ReadU8(record + EquipmentConsumableOffset);
             }
-            memory.WriteU8(record + 0x16, 31);
+        }
+
+        for (int i = 0; i < records.Length; i++)
+        {
+            memory.WriteU8(records[i] + EquipmentChainLimitOffset, 31);
+            memory.WriteU8(records[i] + EquipmentConsumableOffset, 0);
+        }
+        for (int i = 0; i < records.Length; i++)
+        {
+            if (memory.ReadU8(records[i] + EquipmentChainLimitOffset) == 31 &&
+                memory.ReadU8(records[i] + EquipmentConsumableOffset) == 0) continue;
+            Console.Error.WriteLine($"[Guns] equipment patch verification failed for {GunCatalog.All[i].Name}");
+            return false;
         }
         _equipmentDefinitions = definitions;
         _equipmentPatched = true;
@@ -482,12 +503,21 @@ public sealed class Guns : IMod
         }
         for (int i = 0; i < GunCatalog.All.Length; i++)
         {
-            uint record = definitions + (uint)(GunCatalog.All[i].ItemId * 0x32);
-            if (memory.ReadU8(record + 0x16) == 31)
-                memory.WriteU8(record + 0x16, _originalChainLimit[i]);
+            if (!TryGetEquipmentRecord(memory, definitions, GunCatalog.All[i], out uint record)) continue;
+            if (memory.ReadU8(record + EquipmentChainLimitOffset) == 31)
+                memory.WriteU8(record + EquipmentChainLimitOffset, _originalChainLimit[i]);
+            if (memory.ReadU8(record + EquipmentConsumableOffset) == 0)
+                memory.WriteU8(record + EquipmentConsumableOffset, _originalConsumable[i]);
         }
         _equipmentPatched = false;
         _equipmentDefinitions = 0;
+    }
+
+    private static bool TryGetEquipmentRecord(IMemory memory, uint definitions, GunDefinition gun, out uint record)
+    {
+        record = definitions + gun.ItemId * EquipmentStride;
+        return memory.ReadU8(record + EquipmentWeaponIdOffset) == 15 &&
+               memory.ReadU16(record + EquipmentIconOffset) == gun.ItemId;
     }
 
     private bool PatchNames()
@@ -500,7 +530,12 @@ public sealed class Guns : IMod
         var addresses = new uint[GunCatalog.All.Length];
         for (int i = 0; i < GunCatalog.All.Length; i++)
         {
-            addresses[i] = memory.ReadU32(definitions + (uint)(GunCatalog.All[i].ItemId * 0x32));
+            if (!TryGetEquipmentRecord(memory, definitions, GunCatalog.All[i], out uint record))
+            {
+                Console.Error.WriteLine($"[Guns] name record validation failed for {GunCatalog.All[i].Name}");
+                return false;
+            }
+            addresses[i] = memory.ReadU32(record);
             if (addresses[i] == 0 || Array.IndexOf(addresses, addresses[i], 0, i) >= 0)
             {
                 Console.Error.WriteLine("[Guns] item name buffers are unavailable or aliased; names were not patched");
@@ -618,7 +653,6 @@ public sealed class Guns : IMod
     {
         var view = Runtime.View;
         _autoReload = view.GetBool(SettingsPrefix + "autoReload", true);
-        _grantWeapons = view.GetBool(SettingsPrefix + "grantWeapons", true);
         _deadzone = Math.Clamp(view.GetFloat(SettingsPrefix + "deadzone", 0.18f), 0.05f, 0.45f);
         _spreadScale = Math.Clamp(view.GetFloat(SettingsPrefix + "spreadScale", 1f), 0f, 2f);
     }
@@ -627,7 +661,6 @@ public sealed class Guns : IMod
     {
         var view = Runtime.View;
         view.SetBool(SettingsPrefix + "autoReload", _autoReload);
-        view.SetBool(SettingsPrefix + "grantWeapons", _grantWeapons);
         view.SetFloat(SettingsPrefix + "deadzone", _deadzone);
         view.SetFloat(SettingsPrefix + "spreadScale", _spreadScale);
         Runtime.SaveView();
@@ -652,6 +685,12 @@ public sealed class Guns : IMod
         if (GunCatalog.IndexOfItem(itemId) < 0) return true;
         context.V0 = 0;
         return false;
+    }
+
+    [PostHook("dra", "func_800FB23C")]
+    private static void RepairGunOwnershipAfterEquip(CpuContext context, IMemory memory)
+    {
+        _instance?.EnsureGunOwnership();
     }
 
     [PostHook("dra", "UpdatePlayerEntities")]
@@ -713,45 +752,77 @@ public sealed class Guns : IMod
             DrawTracer(ForegroundOrder, x - vx * 1.5f, y - vy * 1.5f, x, y, 1.25f, 255, 224, 96);
         }
 
-        if (!CanUseGuns() || mod.EquippedGunIndex() < 0) return;
+        int gunIndex = mod.EquippedGunIndex();
+        if (!CanUseGuns() || gunIndex < 0) return;
 
         float anchorX = bufferX + Player.PosX;
         float anchorY = bufferY + Player.PosY - 10;
-        DrawGun(ForegroundOrder, anchorX, anchorY, mod._aimX, mod._aimY);
+        DrawGun(ForegroundOrder, anchorX, anchorY, GunCatalog.All[gunIndex].Kind, mod._aimX, mod._aimY);
         DrawAimArrow(ForegroundOrder, anchorX, anchorY, mod._aimX, mod._aimY);
     }
 
-    private static void DrawGun(int order, float x, float y, float dirX, float dirY)
+    private static void DrawGun(int order, float x, float y, GunKind kind, float dirX, float dirY)
     {
-        float normalX = -dirY;
-        float normalY = dirX;
-        DrawOrientedQuad(order, x + dirX * 2, y + dirY * 2, dirX, dirY, 18, 4, 112, 120, 132);
-        DrawOrientedQuad(order, x - dirX * 2 + normalX * 4, y - dirY * 2 + normalY * 4,
-            dirX * 0.45f + normalX * 0.9f, dirY * 0.45f + normalY * 0.9f, 8, 3, 72, 76, 84);
+        float nx = -dirY;
+        float ny = dirX;
+        switch (kind)
+        {
+            case GunKind.Pistol:
+                DrawOrientedQuad(order, x + dirX * 6f, y + dirY * 6f,
+                    dirX, dirY, 12f, 2f, 150, 158, 170);
+                DrawOrientedQuad(order, x + dirX * 1.5f + nx * 3f, y + dirY * 1.5f + ny * 3f,
+                    dirX * 0.45f + nx * 0.9f, dirY * 0.45f + ny * 0.9f, 6f, 1.5f, 66, 70, 78);
+                break;
+
+            case GunKind.Shotgun:
+                DrawOrientedQuad(order, x + dirX * 9f, y + dirY * 9f,
+                    dirX, dirY, 22f, 1.5f, 102, 108, 116);
+                DrawOrientedQuad(order, x - dirX * 3f, y - dirY * 3f,
+                    dirX, dirY, 8f, 2.5f, 112, 72, 42);
+                break;
+
+            case GunKind.AssaultRifle:
+                DrawOrientedQuad(order, x + dirX * 7.5f, y + dirY * 7.5f,
+                    dirX, dirY, 17f, 2f, 94, 108, 92);
+                DrawOrientedQuad(order, x - dirX * 2.5f, y - dirY * 2.5f,
+                    dirX, dirY, 7f, 2.5f, 58, 64, 58);
+                DrawOrientedQuad(order, x + dirX * 3f + nx * 3.5f, y + dirY * 3f + ny * 3.5f,
+                    nx, ny, 6f, 1.5f, 54, 60, 54);
+                break;
+
+            case GunKind.MachineGun:
+                DrawOrientedQuad(order, x + dirX * 8.5f, y + dirY * 8.5f,
+                    dirX, dirY, 19f, 2.5f, 76, 82, 94);
+                DrawOrientedQuad(order, x + dirX * 20f, y + dirY * 20f,
+                    dirX, dirY, 7f, 1f, 126, 132, 142);
+                DrawOrientedQuad(order, x + dirX * 4f + nx * 3.5f, y + dirY * 4f + ny * 3.5f,
+                    nx, ny, 5f, 2.25f, 54, 58, 68);
+                break;
+        }
     }
 
     private static void DrawAimArrow(int order, float x, float y, float dirX, float dirY)
     {
         float nx = -dirY;
         float ny = dirX;
-        float startX = x + dirX * 13f;
-        float startY = y + dirY * 13f;
-        float shaftX = x + dirX * 43f;
-        float shaftY = y + dirY * 43f;
-        float tipX = x + dirX * 52f;
-        float tipY = y + dirY * 52f;
+        float startX = x + dirX * 22f;
+        float startY = y + dirY * 22f;
+        float shaftX = x + dirX * 29f;
+        float shaftY = y + dirY * 29f;
+        float tipX = x + dirX * 34f;
+        float tipY = y + dirY * 34f;
 
-        DrawSolidTracer(order, startX, startY, shaftX, shaftY, 3f, 0, 0, 0);
-        DrawSolidTracer(order, startX, startY, shaftX, shaftY, 1.5f, 255, 232, 48);
+        DrawSolidTracer(order, startX, startY, shaftX, shaftY, 1.25f, 0, 0, 0);
+        DrawSolidTracer(order, startX, startY, shaftX, shaftY, 0.5f, 255, 232, 48);
 
         var outlineA = new PrimVertex(tipX, tipY, 0, 0, 0);
-        var outlineB = new PrimVertex(shaftX + nx * 7f, shaftY + ny * 7f, 0, 0, 0);
-        var outlineC = new PrimVertex(shaftX - nx * 7f, shaftY - ny * 7f, 0, 0, 0);
+        var outlineB = new PrimVertex(shaftX + nx * 3f, shaftY + ny * 3f, 0, 0, 0);
+        var outlineC = new PrimVertex(shaftX - nx * 3f, shaftY - ny * 3f, 0, 0, 0);
         GpuPrims.Tri(order, outlineA, outlineB, outlineC);
 
-        var arrowA = new PrimVertex(tipX - dirX * 2f, tipY - dirY * 2f, 255, 232, 48);
-        var arrowB = new PrimVertex(shaftX + nx * 4.5f, shaftY + ny * 4.5f, 255, 232, 48);
-        var arrowC = new PrimVertex(shaftX - nx * 4.5f, shaftY - ny * 4.5f, 255, 232, 48);
+        var arrowA = new PrimVertex(tipX - dirX, tipY - dirY, 255, 232, 48);
+        var arrowB = new PrimVertex(shaftX + nx * 2f, shaftY + ny * 2f, 255, 232, 48);
+        var arrowC = new PrimVertex(shaftX - nx * 2f, shaftY - ny * 2f, 255, 232, 48);
         GpuPrims.Tri(order, arrowA, arrowB, arrowC);
     }
 
